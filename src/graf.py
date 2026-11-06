@@ -9,39 +9,46 @@ from src.sources import fix_typos, search, web_search
 
 
 class S(TypedDict, total=False):
-    question: str
-    fixed: str
-    is_search: bool
-    subs: List[str]
-    i: int
-    source: str
-    query: str
-    tries: int
-    regen: int
-    docs: list
-    mode: str            # rag / web / llm
+    """Состояние графа: «рабочая тетрадь», которую узлы передают друг другу.
+    Каждый узел возвращает только те поля, которые меняет."""
+    question: str        # исходный вопрос пользователя
+    fixed: str           # вопрос после исправления опечаток
+    is_search: bool      # True - поисковый запрос, False - разговорный
+    subs: List[str]      # подвопросы (для составного вопроса их 2-3)
+    i: int               # номер текущего подвопроса
+    source: str          # выбранный источник: habr / news / science
+    query: str           # текущий поисковый запрос (может быть переписан)
+    tries: int           # сколько раз переписывали запрос
+    regen: int           # сколько раз перегенерировали ответ
+    docs: list           # найденные документы
+    mode: str            # rag (из базы) / web (из интернета) / llm (без источников)
     is_ok: bool          # grade: контекст релевантен
     ok_answer: bool      # check: ответ подтверждён контекстом
     no_answer: bool      # check: ответ сообщает «в контексте нет»
-    answer_i: str
-    partial: list
-    answer: str
-    log: Annotated[list, operator.add]
-    costs: Annotated[list, operator.add]
+    answer_i: str        # ответ на текущий подвопрос
+    partial: list        # готовые ответы на подвопросы
+    answer: str          # итоговый ответ
+    # Annotated + operator.add: новые записи ДОПИСЫВАЮТСЯ в список, а не затирают его
+    log: Annotated[list, operator.add]     # журнал шагов (для экрана)
+    costs: Annotated[list, operator.add]   # затраты (для Cost Dashboard)
 
 
 def L(node, text):
+    """Запись в журнал шагов."""
     return [dict(node=node, text=text)]
 
 
 def ctx(docs, n=5, cut=700):
+    """Склеивает фрагменты в нумерованный контекст для промпта: [1] Заголовок + текст."""
     return "\n\n".join(f"[{i}] {d['title']}\n{d['text'][:cut]}" for i, d in enumerate(docs[:n], 1))
 
 
+# Приветствия и болтовня определяем правилом, без вызова модели (быстро и надёжно)
 CHAT_RE = re.compile(
     r"^\s*(привет|здравствуй|здорово|добрый (день|вечер|утро)|хай|hello|hi|спасибо|благодарю|"
     r"пока|до свидания|как дела|кто ты|что ты умеешь|что умеешь|ты кто)\b", re.I)
 
+# Фразы, по которым видно, что модель не нашла ответа в контексте
 NOANS = re.compile(r"не имеет отношения|нет информации|не содержит|в контексте нет|"
                    r"не могу ответить|нет ответа|не упоминается|не говорится", re.I)
 
@@ -49,10 +56,12 @@ NOANS = re.compile(r"не имеет отношения|нет информац�
 # ---------- узлы ----------
 
 def classify(s):
+    """Пункт 2: поисковый или разговорный запрос."""
     q = s["question"]
-    if CHAT_RE.search(q) and len(q) < 60:
+    if CHAT_RE.search(q) and len(q) < 60:      # очевидное приветствие: без LLM
         return dict(is_search=False, costs=[],
                     log=L("classify", "разговорный запрос (правило)"))
+    # неочевидные случаи решает маленькая модель, в промпте даны примеры
     out, c = call("small", "classify",
         "Определи тип сообщения пользователя. Ответь ОДНИМ словом.\n"
         "SEARCH — просьба найти информацию, факты, новости, статьи, объяснить тему.\n"
@@ -66,6 +75,7 @@ def classify(s):
 
 
 def chat(s):
+    """Пункт 2: ответ на разговорный вопрос без поиска."""
     out, c = call("small", "chat",
         "Ты помощник по базе из статей Хабра, научных статей arXiv и новостей Lenta.ru. "
         "Ты умеешь искать информацию в них, исправлять опечатки, отвечать на составные "
@@ -75,6 +85,7 @@ def chat(s):
 
 
 def spellcheck(s):
+    """Пункт 3: исправление опечаток внешним спеллчекером."""
     fixed, n, sec = fix_typos(s["question"])
     msg = f"исправлено опечаток: {n} → «{fixed}»" if n else "опечаток не найдено"
     return dict(fixed=fixed, costs=[record("spellcheck", "Яндекс.Спеллер", sec=sec)],
@@ -82,7 +93,10 @@ def spellcheck(s):
 
 
 def decompose(s):
+    """Пункт 4: разбиение составного вопроса на простые."""
     q = s["fixed"]
+    # признаки составного вопроса: «и» + вопрос, «а также», несколько знаков вопроса
+    # простой вопрос пропускаем без LLM (быстрее и модель не портит вопрос)
     if not re.search(r"\bи\b.*\?|\bа также\b|\?.+\?|;", q, re.I):
         return dict(subs=[q], i=0, partial=[], costs=[],
                     log=L("decompose", "вопрос простой, разбиение не нужно"))
@@ -90,6 +104,7 @@ def decompose(s):
         "Разбей вопрос на 2-3 простых вопроса, по одному на строку. Каждая строка должна "
         "быть ВОПРОСОМ. Не добавляй фактов и названий, которых нет в исходном вопросе. "
         f"Только вопросы, без нумерации.\n\nВопрос: {q}")
+    # убираем нумерацию, оставляем только строки-вопросы, не больше трёх
     subs = [re.sub(r"^[\-\d\.\)\s•]+", "", x).strip() for x in out.splitlines()]
     subs = [x for x in subs if len(x) > 5 and x.endswith("?")][:3] or [q]
     return dict(subs=subs, i=0, partial=[], costs=[c],
@@ -97,6 +112,7 @@ def decompose(s):
 
 
 def route(s):
+    """Пункт 5: определяем тип запроса и выбираем источник."""
     q = s["subs"][s["i"]]
     out, c = call("small", "route",
         "Выбери источник для поиска ответа. Ответь ОДНИМ словом:\n"
@@ -105,17 +121,19 @@ def route(s):
         "science — научные статьи arXiv (физика, математика, информатика).\n\n"
         f"Вопрос: {q}")
     low = out.lower()
-    source = next((k for k in ("habr", "news", "science") if k in low), "habr")
+    source = next((k for k in ("habr", "news", "science") if k in low), "habr")  # по умолчанию habr
     costs, query = [c], q
-    if source == "science":      # аннотации arXiv на английском
+    if source == "science":      # аннотации arXiv на английском: переводим запрос
         query, c2 = call("small", "translate",
                          f"Переведи поисковый запрос на английский, только перевод:\n{q}")
         costs.append(c2)
+    # для нового подвопроса сбрасываем счётчики попыток
     return dict(source=source, query=query, tries=0, regen=0, costs=costs,
                 log=L("route", f"подвопрос «{q}» → источник {source}"))
 
 
 def retrieve(s):
+    """Поиск в выбранном источнике (гибридный: FAISS + BM25)."""
     docs = search(s["query"], s["source"], k=5)
     return dict(docs=docs, mode="rag", costs=[record("retrieve", "FAISS+BM25")],
                 log=L("retrieve", f"запрос «{s['query']}»: найдено {len(docs)}: "
@@ -123,6 +141,7 @@ def retrieve(s):
 
 
 def grade(s):
+    """Пункт 7: самопроверка поиска - подходят ли найденные документы."""
     if not s["docs"]:
         return dict(is_ok=False, log=L("grade", "ничего не найдено"))
     out, c = call("small", "grade",
@@ -134,12 +153,14 @@ def grade(s):
 
 
 def after_grade(s):
+    """Куда идти после grade: подходит -> генерация; нет -> переписать запрос (до 2 раз), потом веб."""
     if s.get("is_ok"):
         return "generate"
     return "rewrite" if s["tries"] < 2 else "web"
 
 
 def rewrite(s):
+    """Пункт 7: самокоррекция - переписываем запрос и возвращаемся к поиску."""
     out, c = call("small", "rewrite",
         "Перепиши поисковый запрос так, чтобы найти ответ в базе статей: ключевые слова, "
         "синонимы, без лишнего. Для тем про программирование используй английские термины "
@@ -152,6 +173,7 @@ def rewrite(s):
 
 
 def web(s):
+    """Пункт 6: в базе ответа нет - ищем в интернете; если пусто, ответит сама LLM."""
     res = web_search(s["subs"][s["i"]])
     docs = [dict(title=r["title"], url=r["url"], text=r["text"], source="web", search_type="web")
             for r in res]
@@ -162,9 +184,11 @@ def web(s):
 
 
 def generate(s):
+    """Генерация ответа крупной моделью по найденному контексту."""
     q = s["subs"][s["i"]]
+    # после неудачной проверки генерируем строже
     strict = " Опирайся строго на контекст, не добавляй фактов от себя." if s["regen"] else ""
-    if s["mode"] == "llm":
+    if s["mode"] == "llm":     # источников нет: отвечает сама модель
         prompt = f"Ответь на вопрос по-русски. Укажи, что ответ дан без источников.\n\nВопрос: {q}"
     else:
         prompt = ("Ответь на вопрос по-русски, используя только контекст. Если ответа в "
@@ -175,10 +199,11 @@ def generate(s):
 
 
 def check(s):
-    if s["mode"] != "rag":
+    """Пункт 7: самопроверка ответа - подтверждён ли он контекстом."""
+    if s["mode"] != "rag":     # для веба и режима LLM проверять не с чем
         return dict(ok_answer=True, no_answer=False,
                     log=L("check", "проверка пропущена (нет источников из базы)"))
-    if NOANS.search(s["answer_i"]):
+    if NOANS.search(s["answer_i"]):   # модель сама написала «в контексте нет»
         return dict(ok_answer=False, no_answer=True,
                     log=L("check", "ответ сообщает, что в контексте ничего нет → возврат к поиску"))
     out, c = call("small", "check",
@@ -191,34 +216,40 @@ def check(s):
 
 
 def after_check(s):
+    """Куда идти после check: «в контексте нет» -> назад к поиску; не подтверждён -> перегенерация (1 раз)."""
     if s.get("no_answer"):
         return "rewrite" if s["tries"] < 2 else "web"
     return "next" if s.get("ok_answer") or s["regen"] >= 1 else "regen"
 
 
 def regen(s):
+    """Отмечаем повторную генерацию (в generate промпт становится строже)."""
     return dict(regen=s["regen"] + 1, log=L("regen", "повторная генерация"))
 
 
 def nxt(s):
+    """Сохраняем готовый ответ на подвопрос и переходим к следующему."""
     part = s["partial"] + [dict(q=s["subs"][s["i"]], answer=s["answer_i"], source=s["source"],
                                 mode=s["mode"], docs=s["docs"])]
     return dict(partial=part, i=s["i"] + 1, log=L("next", f"подвопрос {s['i'] + 1} готов"))
 
 
 def more(s):
+    """Остались подвопросы -> снова route; иначе собираем итоговый ответ."""
     return "route" if s["i"] < len(s["subs"]) else "compose"
 
 
 def compose(s):
+    """Пункт 4: сборка итогового ответа из ответов на подвопросы."""
     p = s["partial"]
     ans = p[0]["answer"] if len(p) == 1 else "\n\n".join(f"**{x['q']}**\n\n{x['answer']}" for x in p)
     return dict(answer=ans, log=L("compose", "итоговый ответ собран"))
 
 
-# ---------- граф ----------
+# ---------- сборка графа ----------
 
 g = StateGraph(S)
+# регистрируем все узлы
 for name, fn in [("classify", classify), ("chat", chat), ("spellcheck", spellcheck),
                  ("decompose", decompose), ("route", route), ("retrieve", retrieve),
                  ("grade", grade), ("rewrite", rewrite), ("web", web), ("generate", generate),
@@ -226,19 +257,22 @@ for name, fn in [("classify", classify), ("chat", chat), ("spellcheck", spellche
     g.add_node(name, fn)
 
 g.add_edge(START, "classify")
+# разговорный -> chat и конец; поисковый -> spellcheck
 g.add_conditional_edges("classify", lambda s: "spellcheck" if s["is_search"] else "chat")
 g.add_edge("chat", END)
 g.add_edge("spellcheck", "decompose")
 g.add_edge("decompose", "route")
 g.add_edge("route", "retrieve")
 g.add_edge("retrieve", "grade")
+# после grade: generate / rewrite / web
 g.add_conditional_edges("grade", after_grade, {"generate": "generate", "rewrite": "rewrite", "web": "web"})
-g.add_edge("rewrite", "retrieve")
+g.add_edge("rewrite", "retrieve")     # возврат к поиску с новым запросом (цикл)
 g.add_edge("web", "generate")
 g.add_edge("generate", "check")
+# после check: следующий подвопрос / перегенерация / возврат к поиску / веб
 g.add_conditional_edges("check", after_check,
                         {"next": "next", "regen": "regen", "rewrite": "rewrite", "web": "web"})
-g.add_edge("regen", "generate")
+g.add_edge("regen", "generate")       # возврат к генерации (цикл)
 g.add_conditional_edges("next", more, {"route": "route", "compose": "compose"})
 g.add_edge("compose", END)
 
