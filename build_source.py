@@ -2,38 +2,43 @@ import ast, json, os, sqlite3, tarfile, warnings
 import pandas as pd
 from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
 
+# BeautifulSoup ругается на короткие заголовки, похожие на имя файла или URL; на результат это не влияет
 warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
+# Пути к трём архивам (читаем напрямую, без распаковки)
 D = r"C:\Users\Gulshat\Downloads"
 HABR = os.path.join(D, "10_000-постов-Хабр.csv.bz2")
 NEWS = os.path.join(D, "10_000-постов-Лента.csv.bz2")
 ARXIV = os.path.join(D, "10_000-статей-arxiv2.tar.gz")
-LIMIT = 10000
+LIMIT = 10000   # по заданию: 10 тысяч текстов на источник
 
 
 def html_to_text(html):
+    """Хабр хранит статьи в HTML: превращаем в чистый текст с абзацами."""
     soup = BeautifulSoup(html or "", "lxml")
-    for t in soup(["script", "style"]):
+    for t in soup(["script", "style"]):          # скрипты и стили не нужны
         t.decompose()
-    for pre in soup.find_all("pre"):
+    for pre in soup.find_all("pre"):             # блоки кода сохраняем в тройных кавычках
         pre.replace_with("\n```\n" + pre.get_text() + "\n```\n")
     for t in soup.find_all(["p", "li", "div", "blockquote", "h1", "h2", "h3", "h4", "tr"]):
-        t.append("\n\n")
+        t.append("\n\n")                         # после абзацев и заголовков пустая строка
     text = "\n".join(l.rstrip() for l in soup.get_text().splitlines())
-    while "\n\n\n" in text:
+    while "\n\n\n" in text:                      # схлопываем лишние пустые строки
         text = text.replace("\n\n\n", "\n\n")
     return text.strip()
 
 
 def split(text, size=1000):
+    """Режем текст на фрагменты (chunks) примерно по 1000 символов по границам абзацев.
+    Фрагмент - единица, которую находит поиск и которую получает языковая модель."""
     parts = []
     for p in text.split("\n\n"):
-        while len(p) > size:
+        while len(p) > size:                     # слишком длинный абзац режем жёстко
             parts.append(p[:size]); p = p[size:]
         if p.strip():
             parts.append(p)
     out, buf = [], ""
-    for p in parts:
+    for p in parts:                              # копим абзацы в буфер, пока не превысит size
         if buf and len(buf) + len(p) > size:
             out.append(buf.strip()); buf = ""
         buf += p + "\n\n"
@@ -43,11 +48,15 @@ def split(text, size=1000):
 
 
 def lst(s):
+    """Хабы и теги в CSV записаны строкой "['a', 'b']": превращаем обратно в список."""
     try:
         return ast.literal_eval(s) if isinstance(s, str) else []
     except Exception:
         return []
 
+
+# Три генератора приводят разные форматы к одному виду:
+# source, doc_id, title, url, date, topic, text
 
 def habr_docs():
     df = pd.read_csv(HABR, compression="bz2")
@@ -59,12 +68,14 @@ def habr_docs():
 
 def news_docs():
     df = pd.read_csv(NEWS, compression="bz2")
-    for i, r in enumerate(df.itertuples()):
+    for i, r in enumerate(df.itertuples()):     # у новостей нет id, берём номер строки
         yield dict(source="news", doc_id=str(i), title=str(r.title), url=str(r.url),
                    date=str(r.date), topic=str(r.topic), text=str(r.text))
 
 
 def science_docs():
+    # arXiv: архив с JSON-файлами, поля названы цифрами:
+    # 202 - заголовок, 81 - аннотация, 203 - дата, 230 - категория, 236 - id статьи
     with tarfile.open(ARXIV, "r:gz") as t:
         for m in t:
             if not m.isfile() or not m.name.endswith(".json"):
@@ -77,21 +88,24 @@ def science_docs():
                        text=" ".join(str(meta.get("81", "")).split()))
 
 
+# Создаём базу SQLite: одна строка таблицы = один фрагмент текста
 os.makedirs("data", exist_ok=True)
 db = sqlite3.connect("data/lab4.db")
 db.executescript("""
 DROP TABLE IF EXISTS fts; DROP TABLE IF EXISTS metadata;
 CREATE TABLE metadata(id INTEGER PRIMARY KEY, source TEXT, doc_id TEXT, title TEXT, url TEXT,
     date TEXT, topic TEXT, chunk_id INTEGER, text TEXT);
-CREATE INDEX idx_source ON metadata(source);
+CREATE INDEX idx_source ON metadata(source);   -- ускоряет фильтр по источнику
 """)
 
 for gen in (habr_docs, news_docs, science_docs):
     seen, n = set(), 0
     for d in gen():
+        # пропускаем дубли (в arXiv их много) и слишком короткие тексты
         if d["doc_id"] in seen or len(d["text"]) < 100:
             continue
         seen.add(d["doc_id"])
+        # документ режем на фрагменты; chunk_id - номер фрагмента внутри документа
         db.executemany(
             "INSERT INTO metadata(source,doc_id,title,url,date,topic,chunk_id,text) VALUES (?,?,?,?,?,?,?,?)",
             [(d["source"], d["doc_id"], d["title"], d["url"], d["date"], d["topic"], i, c)
@@ -102,6 +116,8 @@ for gen in (habr_docs, news_docs, science_docs):
     db.commit()
     print(d["source"], "документов:", n, flush=True)
 
+# Полнотекстовый индекс FTS5 (поиск по словам, BM25) поверх таблицы metadata.
+# content='metadata': текст второй раз не хранится, индекс ссылается на таблицу по id
 db.executescript("""
 CREATE VIRTUAL TABLE fts USING fts5(title, text, content='metadata', content_rowid='id', tokenize='unicode61');
 INSERT INTO fts(fts) VALUES('rebuild');
